@@ -1,7 +1,7 @@
 [project]
 name = "booth-tracker"
 version = "0.1.0"
-description = "Add your description here"
+description = "體感攤位遊戲共用的玩家追蹤：深度相機 + 姿勢偵測，路人搶不走鎖定"
 readme = "README.md"
 authors = [
     { name = "YC815", email = "yushun@chen.zone" }
@@ -17,6 +17,9 @@ dependencies = [
 orbbec = [
     "pyorbbecsdk2>=2.1.2",
 ]
+
+[project.scripts]
+booth-tracker = "booth_tracker.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
