@@ -2,6 +2,7 @@
 name = "booth-tracker"
 version = "0.1.0"
 description = "體感攤位遊戲共用的玩家追蹤：深度相機 + 姿勢偵測，路人搶不走鎖定"
+license = "MIT"
 readme = "README.md"
 authors = [
     { name = "YC815", email = "yushun@chen.zone" }
