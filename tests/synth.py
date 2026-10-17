@@ -28,12 +28,17 @@ STANDING = {
 }
 
 
-def world_joints(x: float, z: float) -> dict[str, np.ndarray]:
-    return {j: np.array([x + dx, y, z]) for j, (dx, y) in STANDING.items()}
+def world_joints(x: float, z: float, hands_up: bool = False) -> dict[str, np.ndarray]:
+    out = {j: np.array([x + dx, y, z]) for j, (dx, y) in STANDING.items()}
+    if hands_up:
+        for side, dx in (("left", -0.22), ("right", 0.22)):
+            out[f"{side}_elbow"] = np.array([x + dx, 1.6, z])
+            out[f"{side}_wrist"] = np.array([x + dx, 1.85, z])
+    return out
 
 
-def detection(x: float, z: float, pose: CameraPose = POSE, k: Intrinsics = K) -> Detection:
-    world = world_joints(x, z)
+def detection(x: float, z: float, pose: CameraPose = POSE, k: Intrinsics = K, hands_up: bool = False) -> Detection:
+    world = world_joints(x, z, hands_up)
     names = list(world)
     px = pose.project(np.array([world[n] for n in names]), k)
     pixels = {n: (float(u), float(v)) for n, (u, v) in zip(names, px)}
