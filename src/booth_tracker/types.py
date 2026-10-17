@@ -51,6 +51,37 @@ TORSO: tuple[str, ...] = ("left_shoulder", "right_shoulder", "left_hip", "right_
 
 
 @dataclass
+class Intrinsics:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+
+@dataclass
+class Frame:
+    """相機一幀。相機座標：x 往右、y 往下、z 往前（公尺）。"""
+
+    rgb: np.ndarray  # HxWx3 uint8，RGB 順序
+    depth_m: np.ndarray | None  # HxW float32，已對齊到 rgb，0 = 無效
+    intrinsics: Intrinsics | None
+    ts: float  # 秒
+    gravity: np.ndarray | None = None  # IMU 量到的重力方向（相機座標，單位向量），沒有就 None
+
+
+@dataclass
+class Detection:
+    """姿勢模型對一個人的原始輸出（還沒加深度）。"""
+
+    pixels: dict[str, tuple[float, float]]  # (u, v) 彩色影像像素
+    visibility: dict[str, float]
+    model_world: dict[str, np.ndarray]  # 模型估的 3D（以髖部中心為原點，x 右、y 下、z 遠離相機，公尺）
+    mask: np.ndarray | None = None  # HxW float32 0..1
+
+
+@dataclass
 class Person:
     """一幀裡偵測到的一個人。"""
 
