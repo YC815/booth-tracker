@@ -1,13 +1,13 @@
 # Orbbec Gemini 336L 接入說明
 
-程式：`backend/src/aero/sources/orbbec.py`（FrameSource）、`backend/src/aero/doctor.py`（診斷）。
+程式：`src/booth_tracker/sources/orbbec.py`（FrameSource）、`src/booth_tracker/doctor.py`（診斷）。
 
 ## 安裝（已驗證：PyPI wheel 可用）
 
 - PyPI 套件名是 **`pyorbbecsdk2`**（import 名稱仍是 `pyorbbecsdk`）。2.1.2（2026-08-11）有 `cp312-cp312-macosx_13_0_arm64` wheel；2.0.18 沒有 macOS wheel。
   來源：<https://pypi.org/project/pyorbbecsdk2/>（JSON API 檔案清單）、<https://github.com/orbbec/pyorbbecsdk>（`v2-main` 分支 README：支援 macOS，測試環境 M2 / macOS 13.2；SDK v2 才支援 Gemini 330 系列）。
 - 本專案：`uv add --optional orbbec pyorbbecsdk2` 已加入 `pyproject.toml`（extra 名 `orbbec`）。
-  - 安裝：`cd backend && uv sync --extra orbbec`；執行：`uv run --extra orbbec ...`。
+  - 安裝：`uv sync --extra orbbec`；執行：`uv run --extra orbbec ...`。
   - 本機 macOS arm64 / Python 3.12 實測 `import pyorbbecsdk` 成功，`get_version()` = 2.9.3。
 - 若將來 wheel 不能用：從 GitHub Releases 取 wheel，或照 <https://github.com/orbbec/pyorbbecsdk> README 從 source build（本專案沒走過這條路，步驟未驗證）。`orbbec.py` 匯入失敗時的錯誤訊息會指向本文件。
 
@@ -18,7 +18,7 @@ macOS 的 `UVCAssistant` 常駐程式會獨佔所有 UVC 裝置，Orbbec 相機�
 
 - 來源：<https://github.com/orbbec/OrbbecSDK_v2/issues/124>（Femto Mega 的案例，Orbbec 成員回覆 sudo 是暫時解法，尚未修）；社群設定紀錄 <https://gist.github.com/rootnotez/72b0d0ac0f82093689867b5f8338671b>（`uvc_open already opened` → 用 sudo）；OpenCV 的 Orbbec UVC 教學也寫 macOS 需 sudo（<https://docs.opencv.org/4.13.0/d1/d33/tutorial_orbbec_uvc.html>，只看到搜尋摘要，頁面本身 403）。
 - 上述來源的案例是 Femto Mega 與 OrbbecViewer；**沒有找到 Gemini 336L 在 macOS 上的明確紀錄**，只能推論同為 UVC 所以同樣受影響。
-- 做法：`sudo backend/.venv/bin/python -m aero.doctor`。**不要用 `sudo uv run`**（會讓 uv cache 變 root 擁有）。doctor 以 root 存檔時會 chown 回 `SUDO_UID`。
+- 做法：`sudo .venv/bin/booth-tracker doctor`。**不要用 `sudo uv run`**（會讓 uv cache 變 root 擁有）。doctor 以 root 存檔時會 chown 回 `SUDO_UID`。
 - 同一時間只能有一個程式開相機：先關 OrbbecViewer。
 - 官方 SDK 的 `setup_env.py` 寫 macOS 不需額外環境設定；Linux 才需要 udev rules（`99-obsensor-libusb.rules`）。
 
@@ -44,7 +44,7 @@ macOS 的 `UVCAssistant` 常駐程式會獨佔所有 UVC 裝置，Orbbec 相機�
 ## 本專案的行為
 
 - color：請求 1280x720@30，格式依序嘗試，找不到再放寬 fps；全找不到時錯誤訊息列出裝置實際提供的 profile（寬x高 格式 @fps）。預設順序 MJPG、RGB、YUYV、任意。
-  - **環境變數 `AERO_ORBBEC_COLOR=mjpg|rgb`（預設 `mjpg`）**：設成 `rgb` 則優先請求 RGB（官方軟體 D2C 範例用的是 RGB）。若 MJPG 搭配 AlignFilter 出現 depth 全 0 或對齊錯位，明天先改用 `AERO_ORBBEC_COLOR=rgb` 重跑 doctor（root 下記得帶變數：`sudo AERO_ORBBEC_COLOR=rgb backend/.venv/bin/python -m aero.doctor`）。
+  - **環境變數 `BOOTH_ORBBEC_COLOR=mjpg|rgb`（預設 `mjpg`）**：設成 `rgb` 則優先請求 RGB（官方軟體 D2C 範例用的是 RGB）。若 MJPG 搭配 AlignFilter 出現 depth 全 0 或對齊錯位，明天先改用 `BOOTH_ORBBEC_COLOR=rgb` 重跑 doctor（root 下記得帶變數：`sudo BOOTH_ORBBEC_COLOR=rgb .venv/bin/booth-tracker doctor`）。
 - depth：先用 SDK 預設 profile（336L 預設 848x480@30 Y16，解析度小，軟體 D2C 才跑得動）；預設不是 Y16 才搜尋 Y16 profile。不主動搜尋，因為搜尋可能挑到 1280x800 而拖慢 fps。
 - 對齊後 depth 若尺寸與 color 不同，以最近鄰縮放到 color 尺寸。
 - 內參：解析度與 color 幀一致就直接用；長寬比相同就按比例縮放 fx/fy/cx/cy 並更新 width/height（log 警告）；長寬比不同則 `Frame.intrinsics = None` 並只記錄一次 error（不回傳錯的內參）。doctor 第 5 項會 FAIL。
@@ -54,8 +54,8 @@ macOS 的 `UVCAssistant` 常駐程式會獨佔所有 UVC 裝置，Orbbec 相機�
 ## 診斷
 
 ```
-sudo backend/.venv/bin/python -m aero.doctor      # 有相機（macOS）
-cd backend && uv run --extra orbbec python -c "from aero.doctor import run; raise SystemExit(run())"   # 無相機也能跑，預期第 2 項 FAIL
+sudo .venv/bin/booth-tracker doctor      # 有相機（macOS）
+uv run --extra orbbec booth-tracker doctor   # 無相機也能跑，預期第 2 項 FAIL
 ```
 
 逐項印 `[PASS]` / `[FAIL] 原因`，第一個 FAIL 之後標 `[SKIP]`。輸出 `data/doctor.png`（color 與 depth colormap 50% 疊圖）。
