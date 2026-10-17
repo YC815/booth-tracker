@@ -1,11 +1,13 @@
 """玩家鎖定：換人只能靠站位區內舉手認領；追丟只會 hold → paused → idle，絕不自動換人。
 
+可以有 N 個站位區，每區一個鎖定槽，各自獨立。
 每幀把偵測到的人配到「軌跡」（地面 (x, z) 最近鄰），玩家 = 某條軌跡。
-- 認領：站位區內、舉手、幾乎不動，持續 claim_s，而且同時只有一個人這樣做。
+- 認領：區內、舉手、幾乎不動，持續 claim_s，而且區內同時只有一個人這樣做。已是玩家的人不能在任何區認領。
 - 跟隨：玩家軌跡只能配到離上次位置 assoc_radius 內、且沒有比玩家近 occlusion_dz 以上的人；
   兩個候選距離太接近就這幀先不配（hold），不賭。
+- 出區：玩家看得到就照常 track，in_zone=False；連續在區外超過 hold_s + pause_s 才放掉。
 - 認回：玩家軌跡斷掉後，只有「玩家消失之後才出現」的新軌跡、在原位附近、連續 rejoin_frames 幀，才能接回。
-  玩家是自己走出站位區後才消失的，就不認回，要重新舉手。
+  玩家是自己走出區外後才消失的，就不認回，要重新舉手。
 """
 
 from __future__ import annotations
@@ -18,11 +20,28 @@ from booth_tracker.types import Mode, Person, PlayerFrame
 
 
 @dataclass
+class Zone:
+    """站位區：地面上的圓，世界座標。"""
+
+    x: float
+    z: float
+    r_in: float = 0.7  # 進區半徑
+    r_out: float = 1.0  # 出區半徑（遲滯）
+
+    def dist(self, pos: np.ndarray) -> float:
+        return float(np.hypot(pos[0] - self.x, pos[1] - self.z))
+
+
+def side_by_side(center_x: float, z: float, radius: float, gap: float) -> list[Zone]:
+    """左右兩區，中間留 gap 公尺空白帶。出區遲滯只延伸到空白帶中線為止（最多 0.2 m）。"""
+    off = radius + gap / 2
+    r_out = radius + min(0.2, gap / 2)
+    return [Zone(center_x - off, z, radius, r_out), Zone(center_x + off, z, radius, r_out)]
+
+
+@dataclass
 class LockConfig:
-    zone_x: float = 0.0  # 站位區（膠帶）中心，世界座標
-    zone_z: float = 2.5
-    zone_r_in: float = 0.7  # 進站位區半徑
-    zone_r_out: float = 1.0  # 出站位區半徑（遲滯）
+    zones: list[Zone] = field(default_factory=lambda: [Zone(0.0, 2.5)])
     claim_s: float = 1.0  # 舉手要撐多久
     claim_max_speed: float = 0.3  # m/s，舉手時要幾乎站定
     hands_up_margin: float = 0.1  # 雙腕要高於鼻子多少公尺
@@ -35,7 +54,7 @@ class LockConfig:
     rejoin_radius: float = 0.5
     rejoin_frames: int = 8
     hold_s: float = 3.0  # hold 多久變 paused
-    pause_s: float = 8.0  # paused 多久放掉鎖定回 idle
+    pause_s: float = 8.0  # paused 多久放掉鎖定回 idle（出區太久也用 hold_s + pause_s）
 
 
 @dataclass
@@ -45,11 +64,25 @@ class _Track:
     born: float
     seen: float
     person: Person
-    in_zone: bool
+    zone: int | None  # 目前在哪一區（含遲滯）
     speed: float = 0.0  # m/s，EMA
     hits: int = 1  # 連續配到的幀數
     hands_up_since: float | None = None
     det: int | None = None  # 這幀配到的 persons 索引
+
+
+@dataclass
+class _Slot:
+    """一區的鎖定狀態。"""
+
+    lock_id: int | None = None
+    player_id: int | None = None  # 玩家的軌跡 id
+    last_person: Person | None = None
+    last_pos: np.ndarray | None = None
+    last_seen: float = 0.0  # 玩家最後一次配到的時間
+    last_in_zone: bool = False
+    hold_since: float | None = None  # 看不到玩家的起點
+    out_since: float | None = None  # 玩家在區外的起點
 
 
 def _hands_up(p: Person, cfg: LockConfig) -> bool:
@@ -64,40 +97,34 @@ class PlayerLock:
     def __init__(self, config: LockConfig | None = None) -> None:
         self.config = config or LockConfig()
         self._tracks: dict[int, _Track] = {}
+        self._slots = [_Slot() for _ in self.config.zones]
         self._next_track = 1
         self._lock_count = 0
-        self._clear_lock()
 
-    def _clear_lock(self) -> None:
-        self._lock_id: int | None = None
-        self._player_id: int | None = None
-        self._last_person: Person | None = None
-        self._last_pos: np.ndarray | None = None
-        self._last_seen = 0.0  # 玩家最後一次配到的時間
-        self._last_in_zone = False
-        self._hold_since: float | None = None
+    def release(self, zone_id: int | None = None) -> None:
+        """遊戲一局結束時呼叫：放掉鎖定回 idle。zone_id 省略 = 全部區。"""
+        ids = range(len(self._slots)) if zone_id is None else [zone_id]
+        for k in ids:
+            self._slots[k] = _Slot()
 
-    def release(self) -> None:
-        """遊戲一局結束時呼叫：放掉鎖定回 idle。"""
-        self._clear_lock()
+    def _player_ids(self) -> set[int]:
+        return {s.player_id for s in self._slots if s.player_id is not None}
 
     # ---- 軌跡 ----
 
-    def _zone_dist(self, pos: np.ndarray) -> float:
-        return float(np.hypot(pos[0] - self.config.zone_x, pos[1] - self.config.zone_z))
+    def _zone_of(self, pos: np.ndarray, current: int | None) -> int | None:
+        zones = self.config.zones
+        if current is not None and zones[current].dist(pos) <= zones[current].r_out:
+            return current
+        return next((k for k, z in enumerate(zones) if z.dist(pos) <= z.r_in), None)
 
     def _player_ok(self, tr: _Track, pos: np.ndarray) -> bool:
         """玩家軌跡能不能配到這個位置：不能比玩家近 occlusion_dz 以上（那是擋在前面的人）。"""
         return pos[1] >= tr.pos[1] - self.config.occlusion_dz
 
-    def _player_ambiguous(self, dets: list[np.ndarray]) -> bool:
-        player = self._tracks.get(self._player_id) if self._player_id is not None else None
-        if player is None:
-            return False
+    def _ambiguous(self, tr: _Track, dets: list[np.ndarray]) -> bool:
         cfg = self.config
-        near = sorted(
-            float(np.linalg.norm(player.pos - p)) for p in dets if self._player_ok(player, p)
-        )
+        near = sorted(float(np.linalg.norm(tr.pos - p)) for p in dets if self._player_ok(tr, p))
         near = [d for d in near if d <= cfg.assoc_radius]
         return len(near) >= 2 and near[1] - near[0] < cfg.ambiguity_margin
 
@@ -105,16 +132,17 @@ class PlayerLock:
         cfg = self.config
         self._tracks = {k: t for k, t in self._tracks.items() if now - t.seen <= cfg.max_gap_s}
         dets = [persons[i].ground() for i in idx]
-        ambiguous = self._player_ambiguous(dets)
+        players = self._player_ids()
+        ambiguous = [t for t in self._tracks.values() if t.id in players and self._ambiguous(t, dets)]
+        skip = {t.id for t in ambiguous}
         pairs = []
         for tr in self._tracks.values():
             tr.det = None
-            is_player = tr.id == self._player_id
-            if is_player and ambiguous:
+            if tr.id in skip:
                 continue
             for j, p in enumerate(dets):
                 d = float(np.linalg.norm(tr.pos - p))
-                if d <= cfg.assoc_radius and (not is_player or self._player_ok(tr, p)):
+                if d <= cfg.assoc_radius and (tr.id not in players or self._player_ok(tr, p)):
                     pairs.append((d, tr.id, j))
         used: set[int] = set()
         for d, tid, j in sorted(pairs):
@@ -127,26 +155,20 @@ class PlayerLock:
         for tr in self._tracks.values():
             if tr.det is None:
                 tr.hits = 0
-        player = self._tracks.get(self._player_id) if self._player_id is not None else None
         for j, p in enumerate(dets):
             if j in used:
                 continue
-            if ambiguous and player is not None and np.linalg.norm(player.pos - p) <= cfg.assoc_radius:
+            if any(np.linalg.norm(t.pos - p) <= cfg.assoc_radius for t in ambiguous):
                 continue  # 玩家附近分不清的人先不開新軌跡
             self._new_track(persons[idx[j]], p, idx[j], now)
 
     def _update_track(self, tr: _Track, person: Person, pos: np.ndarray, d: float, now: float) -> None:
-        cfg = self.config
         dt = now - tr.seen
         v = d / dt if dt > 0 else 0.0
         tr.speed = 0.5 * tr.speed + 0.5 * v
         tr.pos, tr.seen, tr.person = pos, now, person
         tr.hits += 1
-        zd = self._zone_dist(pos)
-        if zd <= cfg.zone_r_in:
-            tr.in_zone = True
-        elif zd > cfg.zone_r_out:
-            tr.in_zone = False
+        tr.zone = self._zone_of(pos, tr.zone)
         self._update_hands(tr, now)
 
     def _new_track(self, person: Person, pos: np.ndarray, det: int, now: float) -> None:
@@ -156,7 +178,7 @@ class PlayerLock:
             born=now,
             seen=now,
             person=person,
-            in_zone=self._zone_dist(pos) <= self.config.zone_r_in,
+            zone=self._zone_of(pos, None),
             det=det,
         )
         self._next_track += 1
@@ -171,75 +193,95 @@ class PlayerLock:
 
     # ---- 認領 / 認回 ----
 
-    def _claim(self, now: float) -> float:
-        """處理舉手認領；回傳最高的舉手進度 0..1。"""
-        cfg = self.config
+    def _claim(self, k: int, now: float) -> float:
+        """處理 k 區的舉手認領；回傳舉手進度 0..1（區內有兩人舉手時為 0）。"""
+        players = self._player_ids()
         raising = [
             t
             for t in self._tracks.values()
-            if t.det is not None and t.in_zone and t.hands_up_since is not None and t.id != self._player_id
+            if t.det is not None and t.zone == k and t.hands_up_since is not None and t.id not in players
         ]
-        if not raising:
+        if len(raising) != 1:
             return 0.0
-        progress = min(1.0, max((now - t.hands_up_since) / cfg.claim_s for t in raising))
-        if len(raising) != 1 or progress < 1.0:
-            return progress if len(raising) == 1 else 0.0
         tr = raising[0]
-        self._clear_lock()
+        progress = min(1.0, (now - tr.hands_up_since) / self.config.claim_s)
+        if progress < 1.0:
+            return progress
         self._lock_count += 1
-        self._lock_id = self._lock_count
-        self._player_id = tr.id
+        self._slots[k] = _Slot(lock_id=self._lock_count, player_id=tr.id)
         tr.hands_up_since = None
         return 0.0
 
-    def _rejoin(self) -> None:
+    def _rejoin(self, k: int) -> None:
         cfg = self.config
-        if not self._last_in_zone or self._last_pos is None:
+        slot = self._slots[k]
+        if not slot.last_in_zone or slot.last_pos is None:
             return
-        last = self._last_pos
+        last = slot.last_pos
+        players = self._player_ids()
         cands = [
             t
             for t in self._tracks.values()
             if t.det is not None
-            and t.born > self._last_seen
-            and t.in_zone
+            and t.id not in players
+            and t.born > slot.last_seen
+            and t.zone == k
             and t.hits >= cfg.rejoin_frames
             and np.linalg.norm(t.pos - last) <= cfg.rejoin_radius
             and t.pos[1] >= last[1] - cfg.occlusion_dz
         ]
         if len(cands) == 1:
-            self._player_id = cands[0].id
+            slot.player_id = cands[0].id
 
     # ---- 主流程 ----
 
-    def update(self, persons: list[Person], now: float) -> PlayerFrame:
+    def update(self, persons: list[Person], now: float) -> list[PlayerFrame]:
         cfg = self.config
         idx = [i for i, p in enumerate(persons) if p.has_depth or not cfg.require_depth]
         self._associate(persons, idx, now)
+        return [self._update_slot(k, now) for k in range(len(self._slots))]
 
-        tracking = self._player_id is not None and self._player_id in self._tracks and self._tracks[self._player_id].det is not None
-        progress = 0.0
-        if not (tracking and self._tracks[self._player_id].in_zone):
-            progress = self._claim(now)
+    def _update_slot(self, k: int, now: float) -> PlayerFrame:
+        cfg = self.config
+        slot = self._slots[k]
+        player = self._tracks.get(slot.player_id) if slot.player_id is not None else None
+        visible_in_zone = player is not None and player.det is not None and player.zone == k
+        progress = 0.0 if visible_in_zone else self._claim(k, now)
+        slot = self._slots[k]  # 認領會換掉整個槽
+        others = self._player_ids() - {slot.player_id}
+        occupied = any(t.det is not None and t.zone == k and t.id not in others for t in self._tracks.values())
 
-        if self._lock_id is None:
-            return PlayerFrame(mode="idle", lock_id=None, player=None, player_index=None, claim_progress=progress)
+        def frame(mode: Mode, **kw) -> PlayerFrame:
+            lock_id = self._slots[k].lock_id
+            return PlayerFrame(zone_id=k, mode=mode, lock_id=lock_id, occupied=occupied, claim_progress=progress, **kw)
 
-        if self._player_id not in self._tracks:
-            self._rejoin()
-        player = self._tracks.get(self._player_id)
+        if slot.lock_id is None:
+            return frame("idle", player=None, player_index=None)
+
+        if slot.player_id not in self._tracks:
+            self._rejoin(k)
+        player = self._tracks.get(slot.player_id)
         if player is not None and player.det is not None:
-            self._last_pos, self._last_seen = player.pos, now
-            self._last_in_zone = player.in_zone
-            if player.in_zone:
-                self._last_person, self._hold_since = player.person, None
-                return PlayerFrame(mode="track", lock_id=self._lock_id, player=player.person, player_index=player.det)
+            return self._track_frame(k, slot, player, now, frame)
 
-        if self._hold_since is None:
-            self._hold_since = now
-        held = now - self._hold_since
+        if slot.hold_since is None:
+            slot.hold_since = now
+        held = now - slot.hold_since
         if held > cfg.hold_s + cfg.pause_s:
-            self._clear_lock()
-            return PlayerFrame(mode="idle", lock_id=None, player=None, player_index=None, claim_progress=progress)
-        mode: Mode = "paused" if held > cfg.hold_s else "hold"
-        return PlayerFrame(mode=mode, lock_id=self._lock_id, player=self._last_person, player_index=None, claim_progress=progress)
+            self._slots[k] = _Slot()
+            return frame("idle", player=None, player_index=None)
+        return frame("paused" if held > cfg.hold_s else "hold", player=slot.last_person, player_index=None)
+
+    def _track_frame(self, k: int, slot: _Slot, player: _Track, now: float, frame) -> PlayerFrame:
+        cfg = self.config
+        in_zone = player.zone == k
+        slot.last_pos, slot.last_seen, slot.last_in_zone = player.pos, now, in_zone
+        slot.last_person, slot.hold_since = player.person, None
+        if in_zone:
+            slot.out_since = None
+        elif slot.out_since is None:
+            slot.out_since = now
+        if slot.out_since is not None and now - slot.out_since > cfg.hold_s + cfg.pause_s:
+            self._slots[k] = _Slot()
+            return frame("idle", player=None, player_index=None)
+        return frame("track", player=player.person, player_index=player.det, in_zone=in_zone)

@@ -66,19 +66,22 @@ class Person:
         return np.array([c[0], c[2]])
 
 
-# idle   沒有玩家，等人在站位區內舉手
-# track  玩家這幀看得到，座標可信
-# hold   玩家暫時不可用（被擋、偵測掉了、走出站位區）：凍結判定，player 是最後一次可信的姿勢
+# idle   這一區沒有玩家，等人在區內舉手
+# track  玩家這幀看得到，座標可信（可能在區外，看 in_zone）
+# hold   玩家暫時看不到（被擋、偵測掉了）：凍結判定，player 是最後一次可信的姿勢
 # paused hold 太久：提示「回到腳印上」，player 同 hold
 Mode = Literal["idle", "track", "hold", "paused"]
 
 
 @dataclass
 class PlayerFrame:
-    """PlayerLock.update() 每幀的輸出。"""
+    """PlayerLock.update() 每幀每一區一個。"""
 
+    zone_id: int
     mode: Mode
-    lock_id: int | None  # 每次舉手認領 +1；變了就代表換了人
+    lock_id: int | None  # 每次舉手認領取新號（各區共用計數，不會撞號）；變了就代表換了人
     player: Person | None
     player_index: int | None  # 玩家在這幀 persons 裡的索引；只有 track 時有值
-    claim_progress: float = 0.0  # idle 時最接近完成的舉手進度 0..1，給畫面提示用
+    in_zone: bool = False  # 鎖定玩家此刻在不在自己這一區
+    occupied: bool = False  # 這一區現在有人站著（未鎖定的人或本區玩家），給「就位亮格」用
+    claim_progress: float = 0.0  # 區內舉手進度 0..1
